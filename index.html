@@ -1,0 +1,1778 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>The Roadmap — A Story in Five Chapters</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;0,9..144,500;0,9..144,600;1,9..144,300;1,9..144,400&amp;family=Instrument+Serif:ital@0;1&amp;family=Manrope:wght@300;400;500;600;700&amp;family=JetBrains+Mono:wght@400;500&amp;display=swap" rel="stylesheet">
+<style>
+  /* ============================================
+     ROOT — shared tokens
+     ============================================ */
+  :root {
+    --font-display: "Fraunces", "Times New Roman", serif;
+    --font-italic: "Instrument Serif", serif;
+    --font-body: "Manrope", system-ui, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, monospace;
+    --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+    --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  }
+
+  /* ============================================
+     THEME 1 — COSMIC GLASSY
+     deep night sky · aurora violets · neon glow
+     ============================================ */
+  body.theme-cosmic {
+    --bg-base: #060418;
+    --bg-deep: #02010a;
+    --surface: rgba(255, 255, 255, 0.04);
+    --surface-strong: rgba(255, 255, 255, 0.07);
+    --border: rgba(255, 255, 255, 0.10);
+    --border-strong: rgba(255, 255, 255, 0.18);
+    --text: #f5f1ff;
+    --text-mid: rgba(245, 241, 255, 0.78);
+    --text-dim: rgba(245, 241, 255, 0.55);
+    --accent-1: #a58bff;     /* violet */
+    --accent-2: #ff7ad6;     /* pink */
+    --accent-3: #6cf0ff;     /* cyan */
+    --accent-4: #ffb86b;     /* warm */
+    --glow-1: rgba(165, 139, 255, 0.55);
+    --glow-2: rgba(255, 122, 214, 0.45);
+    --glow-3: rgba(108, 240, 255, 0.4);
+    --node-line: rgba(255, 255, 255, 0.13);
+    --shadow-card: 0 30px 60px -20px rgba(0, 0, 0, 0.6),
+                   0 0 0 1px rgba(255, 255, 255, 0.05) inset;
+    --chip-bg: rgba(255, 255, 255, 0.06);
+  }
+
+  /* ============================================
+     THEME 2 — PREMIUM SOFT
+     warm cream · daylight · refined editorial
+     ============================================ */
+  body.theme-premium {
+    --bg-base: #f4efe6;
+    --bg-deep: #ebe3d3;
+    --surface: rgba(255, 255, 255, 0.7);
+    --surface-strong: rgba(255, 255, 255, 0.92);
+    --border: rgba(34, 26, 20, 0.10);
+    --border-strong: rgba(34, 26, 20, 0.20);
+    --text: #1f1a14;
+    --text-mid: rgba(31, 26, 20, 0.72);
+    --text-dim: rgba(31, 26, 20, 0.50);
+    --accent-1: #c3623a;     /* terracotta */
+    --accent-2: #6b8a5a;     /* sage */
+    --accent-3: #3d6b8c;     /* dusty blue */
+    --accent-4: #b88a3a;     /* gold */
+    --glow-1: rgba(195, 98, 58, 0.18);
+    --glow-2: rgba(107, 138, 90, 0.16);
+    --glow-3: rgba(61, 107, 140, 0.14);
+    --node-line: rgba(34, 26, 20, 0.15);
+    --shadow-card: 0 30px 50px -25px rgba(80, 50, 20, 0.25),
+                   0 1px 0 rgba(255, 255, 255, 0.6) inset;
+    --chip-bg: rgba(255, 255, 255, 0.6);
+  }
+
+  /* ============================================
+     RESET + BASE
+     ============================================ */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body { min-height: 100vh; }
+
+  body {
+    font-family: var(--font-body);
+    background: var(--bg-base);
+    color: var(--text);
+    overflow-x: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background 0.6s var(--ease-in-out), color 0.6s var(--ease-in-out);
+    position: relative;
+  }
+
+  /* ============================================
+     COSMIC BACKGROUND — aurora orbs + grain
+     ============================================ */
+  .bg-stage {
+    position: fixed; inset: 0; z-index: 0; overflow: hidden;
+    pointer-events: none;
+  }
+
+  .orb {
+    position: absolute;
+    border-radius: 50%;
+    filter: blur(80px);
+    opacity: 0.7;
+    transition: opacity 0.6s var(--ease-out), background 0.6s var(--ease-out);
+  }
+
+  .orb.o1 { top: -10%; left: -8%; width: 520px; height: 520px;
+            background: radial-gradient(circle at 30% 30%, var(--glow-1), transparent 70%); }
+  .orb.o2 { bottom: -15%; right: -10%; width: 600px; height: 600px;
+            background: radial-gradient(circle at 60% 40%, var(--glow-2), transparent 70%); }
+  .orb.o3 { top: 30%; right: 20%; width: 380px; height: 380px;
+            background: radial-gradient(circle at 50% 50%, var(--glow-3), transparent 70%); opacity: 0.5; }
+
+  body.theme-premium .orb { opacity: 0.55; filter: blur(110px); }
+
+  .grain {
+    position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    opacity: 0.05;
+    background-image:
+      url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)' opacity='0.6'/></svg>");
+  }
+
+  body.theme-premium .grain { opacity: 0.08; }
+
+  /* ============================================
+     LAYOUT SHELL
+     ============================================ */
+  .shell {
+    position: relative; z-index: 2;
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 28px 48px 100px;
+    min-height: 100vh;
+  }
+
+  /* ============================================
+     TOPBAR
+     ============================================ */
+  .topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 56px;
+  }
+
+  .brand {
+    display: flex; align-items: center; gap: 14px;
+    font-family: var(--font-display);
+    font-weight: 400;
+    font-size: 22px;
+    letter-spacing: -0.02em;
+  }
+
+  .brand-mark {
+    width: 36px; height: 36px;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: 12px;
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    box-shadow: 0 8px 24px -8px var(--glow-1);
+    position: relative;
+  }
+  .brand-mark::before {
+    content: ""; position: absolute; inset: 1px;
+    border-radius: 11px;
+    background: var(--bg-base);
+    opacity: 0.15;
+  }
+  .brand-mark span {
+    font-family: var(--font-display);
+    font-weight: 500;
+    color: #fff;
+    font-size: 14px;
+    position: relative; z-index: 1;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.3);
+  }
+
+  .brand-text { display: flex; flex-direction: column; line-height: 1.1; }
+  .brand-text small {
+    font-family: var(--font-body);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-top: 2px;
+    font-weight: 500;
+  }
+
+  .topbar-actions { display: flex; gap: 10px; align-items: center; }
+
+  .theme-toggle {
+    display: flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+
+  .theme-toggle button {
+    background: transparent;
+    border: none;
+    padding: 8px 18px;
+    font-family: var(--font-body);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    color: var(--text-mid);
+    cursor: pointer;
+    border-radius: 999px;
+    transition: all 0.3s var(--ease-out);
+    font-weight: 500;
+  }
+
+  .theme-toggle button.active {
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    color: #fff;
+    box-shadow: 0 6px 16px -6px var(--glow-1);
+  }
+
+  body.theme-premium .theme-toggle button.active {
+    background: var(--text);
+    color: var(--bg-base);
+    box-shadow: 0 4px 12px -4px rgba(0,0,0,0.2);
+  }
+
+  .edit-hint {
+    font-family: var(--font-body);
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    padding: 8px 16px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--surface);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    display: flex; align-items: center; gap: 8px;
+  }
+
+  .edit-hint .pulse {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--accent-3);
+    box-shadow: 0 0 10px var(--accent-3);
+    animation: pulse 1.8s var(--ease-in-out) infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.4; transform: scale(0.7); }
+  }
+
+  .save-btn {
+    font-family: var(--font-body);
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    padding: 9px 18px;
+    border-radius: 999px;
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    color: #fff;
+    border: none;
+    cursor: pointer;
+    box-shadow: 0 8px 22px -8px var(--glow-1);
+    transition: all 0.3s var(--ease-out);
+    white-space: nowrap;
+  }
+
+  .save-btn:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 12px 28px -8px var(--glow-1);
+  }
+
+  .save-btn:active { transform: translateY(0); }
+
+  body.theme-premium .save-btn {
+    background: var(--text);
+    color: var(--bg-base);
+    box-shadow: 0 6px 18px -6px rgba(0,0,0,0.25);
+  }
+
+  .edit-hint.saved .pulse {
+    background: #4ade80;
+    box-shadow: 0 0 10px #4ade80;
+  }
+
+  /* ============================================
+     ROADMAP TIMELINE
+     ============================================ */
+  .roadmap {
+    position: relative;
+    margin-bottom: 60px;
+    padding: 0 20px;
+  }
+
+  .roadmap-track {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .roadmap-line {
+    position: absolute;
+    top: 50%;
+    left: 0; right: 0;
+    height: 1px;
+    background: var(--node-line);
+    transform: translateY(-50%);
+    z-index: 0;
+  }
+
+  .roadmap-progress {
+    position: absolute;
+    top: 50%;
+    left: 0;
+    height: 1px;
+    background: linear-gradient(90deg, var(--accent-1), var(--accent-2));
+    transform: translateY(-50%);
+    z-index: 1;
+    transition: width 0.7s var(--ease-out);
+    box-shadow: 0 0 12px var(--glow-1);
+    width: 0%;
+  }
+
+  .roadmap-node {
+    position: relative; z-index: 2;
+    background: var(--bg-base);
+    border: 1px solid var(--border-strong);
+    border-radius: 50%;
+    width: 56px; height: 56px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    cursor: pointer;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-dim);
+    transition: all 0.4s var(--ease-out);
+    padding: 0;
+  }
+
+  .roadmap-node .num {
+    font-weight: 500;
+    letter-spacing: 0.05em;
+  }
+
+  .roadmap-node::after {
+    content: attr(data-label);
+    position: absolute;
+    top: calc(100% + 14px);
+    left: 50%;
+    transform: translateX(-50%);
+    font-family: var(--font-body);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    white-space: nowrap;
+    transition: color 0.4s var(--ease-out);
+    font-weight: 500;
+  }
+
+  .roadmap-node:hover {
+    border-color: var(--accent-1);
+    color: var(--text);
+    transform: scale(1.05);
+  }
+
+  .roadmap-node.active {
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    border-color: transparent;
+    color: #fff;
+    box-shadow: 0 0 0 6px rgba(255,255,255,0.04), 0 0 30px var(--glow-1);
+    transform: scale(1.08);
+  }
+
+  .roadmap-node.done {
+    border-color: var(--accent-1);
+    color: var(--accent-1);
+  }
+
+  .roadmap-node.active::after,
+  .roadmap-node.done::after {
+    color: var(--text);
+  }
+
+  /* ============================================
+     STAGE — the chapter container
+     ============================================ */
+  .stage {
+    position: relative;
+    min-height: 540px;
+  }
+
+  .chapter {
+    display: none;
+    animation: chapter-in 0.7s var(--ease-out);
+  }
+
+  .chapter.active { display: block; }
+
+  @keyframes chapter-in {
+    from { opacity: 0; transform: translateY(24px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ============================================
+     CHAPTER HEADER (shared)
+     ============================================ */
+  .ch-meta {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 24px;
+    font-weight: 500;
+  }
+
+  .ch-meta .dot {
+    width: 5px; height: 5px;
+    border-radius: 50%;
+    background: var(--accent-1);
+    box-shadow: 0 0 8px var(--accent-1);
+  }
+
+  .ch-headline {
+    font-family: var(--font-display);
+    font-weight: 300;
+    font-size: clamp(40px, 6vw, 78px);
+    line-height: 1.02;
+    letter-spacing: -0.025em;
+    margin-bottom: 22px;
+    max-width: 18ch;
+    color: var(--text);
+  }
+
+  .ch-headline em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    font-weight: 400;
+    background: linear-gradient(120deg, var(--accent-1), var(--accent-2), var(--accent-3));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+  }
+
+  body.theme-premium .ch-headline em {
+    background: linear-gradient(120deg, var(--accent-1), var(--accent-4));
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .ch-sub {
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    color: var(--text-mid);
+    max-width: 60ch;
+    margin-bottom: 44px;
+    font-weight: 400;
+  }
+
+  /* ============================================
+     EDITABLE CONTENT
+     ============================================ */
+  [contenteditable="true"] {
+    outline: none;
+    border-radius: 6px;
+    padding: 2px 4px;
+    margin: -2px -4px;
+    transition: background 0.25s var(--ease-out), box-shadow 0.25s var(--ease-out);
+    cursor: text;
+  }
+
+  [contenteditable="true"]:hover {
+    background: var(--surface);
+  }
+
+  [contenteditable="true"]:focus {
+    background: var(--surface-strong);
+    box-shadow: 0 0 0 1px var(--accent-1), 0 0 20px -5px var(--glow-1);
+  }
+
+  /* ============================================
+     CHAPTER 1 — origin
+     ============================================ */
+  .ch1-grid {
+    display: grid;
+    grid-template-columns: 1.2fr 1fr;
+    gap: 44px;
+    align-items: start;
+    margin-top: 20px;
+  }
+
+  .ch1-quote {
+    position: relative;
+    padding: 36px 40px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    box-shadow: var(--shadow-card);
+    overflow: hidden;
+  }
+
+  .ch1-quote::before {
+    content: ""; position: absolute; inset: 0;
+    background: radial-gradient(ellipse at top right, var(--glow-1), transparent 60%);
+    opacity: 0.4;
+    pointer-events: none;
+  }
+
+  .ch1-quote p {
+    font-family: var(--font-display);
+    font-weight: 300;
+    font-size: 22px;
+    line-height: 1.5;
+    color: var(--text);
+    position: relative;
+    letter-spacing: -0.005em;
+  }
+
+  .ch1-quote p em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-1);
+  }
+
+  .ch1-side {
+    display: flex; flex-direction: column; gap: 18px;
+  }
+
+  .ch1-side .stat-card {
+    padding: 22px 24px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+
+  .stat-card .stat-label {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin-bottom: 10px;
+    font-weight: 500;
+  }
+
+  .stat-card .stat-value {
+    font-family: var(--font-display);
+    font-size: 28px;
+    font-weight: 400;
+    line-height: 1.2;
+    color: var(--text);
+    letter-spacing: -0.015em;
+  }
+
+  .stat-card .stat-value em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-2);
+  }
+
+  /* ============================================
+     CHAPTER 2 — the search
+     ============================================ */
+  .ch2-flow {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 18px;
+    margin: 30px 0 36px;
+  }
+
+  .flow-step {
+    padding: 26px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    position: relative;
+    transition: all 0.3s var(--ease-out);
+  }
+
+  .flow-step:hover {
+    transform: translateY(-3px);
+    border-color: var(--border-strong);
+  }
+
+  .flow-step .step-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-1);
+    letter-spacing: 0.18em;
+    margin-bottom: 14px;
+    font-weight: 500;
+  }
+
+  .flow-step h4 {
+    font-family: var(--font-display);
+    font-size: 22px;
+    font-weight: 400;
+    line-height: 1.2;
+    margin-bottom: 10px;
+    letter-spacing: -0.015em;
+    color: var(--text);
+  }
+
+  .flow-step p {
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--text-mid);
+  }
+
+  .ch2-callout {
+    margin-top: 24px;
+    padding: 30px 36px;
+    background: linear-gradient(135deg, var(--surface-strong), var(--surface));
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .ch2-callout::after {
+    content: ""; position: absolute;
+    bottom: -40%; right: -10%;
+    width: 380px; height: 380px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--glow-2), transparent 70%);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  .ch2-callout p {
+    font-family: var(--font-display);
+    font-size: 24px;
+    font-weight: 300;
+    line-height: 1.45;
+    color: var(--text);
+    position: relative;
+    letter-spacing: -0.01em;
+    max-width: 60ch;
+  }
+
+  .ch2-callout p em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-3);
+  }
+
+  /* ============================================
+     CHAPTER 3 — roles
+     ============================================ */
+  .ch3-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 22px;
+    margin-top: 12px;
+  }
+
+  .role-card {
+    padding: 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    box-shadow: var(--shadow-card);
+    position: relative;
+    overflow: hidden;
+    transition: all 0.4s var(--ease-out);
+  }
+
+  .role-card:hover {
+    transform: translateY(-4px);
+    border-color: var(--border-strong);
+  }
+
+  .role-card.role-her::before {
+    content: ""; position: absolute;
+    top: -60%; right: -30%;
+    width: 350px; height: 350px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--glow-1), transparent 70%);
+    pointer-events: none; opacity: 0.6;
+  }
+
+  .role-card.role-him::before {
+    content: ""; position: absolute;
+    top: -60%; right: -30%;
+    width: 350px; height: 350px;
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--glow-3), transparent 70%);
+    pointer-events: none; opacity: 0.6;
+  }
+
+  .role-card > * { position: relative; }
+
+  .role-tag {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    padding: 6px 12px;
+    border-radius: 999px;
+    background: var(--chip-bg);
+    border: 1px solid var(--border);
+    color: var(--text-mid);
+    margin-bottom: 18px;
+    font-weight: 500;
+  }
+
+  .role-card h3 {
+    font-family: var(--font-display);
+    font-size: 32px;
+    font-weight: 400;
+    line-height: 1.1;
+    letter-spacing: -0.02em;
+    margin-bottom: 10px;
+    color: var(--text);
+  }
+
+  .role-card h3 em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-1);
+  }
+
+  .role-card.role-him h3 em { color: var(--accent-3); }
+
+  .role-card .role-title {
+    font-size: 13px;
+    color: var(--text-mid);
+    margin-bottom: 22px;
+    line-height: 1.5;
+  }
+
+  .role-card p.role-body {
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--text-mid);
+    margin-bottom: 22px;
+  }
+
+  .role-services {
+    display: flex; flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .role-services .chip {
+    font-family: var(--font-body);
+    font-size: 12px;
+    padding: 7px 14px;
+    background: var(--chip-bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text);
+    letter-spacing: -0.005em;
+    font-weight: 400;
+  }
+
+  .ch3-coda {
+    margin-top: 26px;
+    padding: 22px 28px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    text-align: center;
+  }
+
+  .ch3-coda p {
+    font-family: var(--font-display);
+    font-size: 19px;
+    font-weight: 400;
+    line-height: 1.5;
+    color: var(--text);
+  }
+
+  .ch3-coda em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-2);
+  }
+
+  /* ============================================
+     CHAPTER 4 — growth
+     ============================================ */
+  .ch4-timeline {
+    margin-top: 24px;
+    padding: 40px 36px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 22px;
+    backdrop-filter: blur(30px);
+    -webkit-backdrop-filter: blur(30px);
+    box-shadow: var(--shadow-card);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .ch4-timeline::before {
+    content: ""; position: absolute;
+    top: -20%; left: -10%;
+    width: 500px; height: 500px;
+    background: radial-gradient(circle, var(--glow-1), transparent 70%);
+    opacity: 0.3; pointer-events: none;
+  }
+
+  .income-bars {
+    position: relative;
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 18px;
+    align-items: end;
+    height: 280px;
+    margin-bottom: 24px;
+  }
+
+  .income-bar {
+    position: relative;
+    display: flex; flex-direction: column;
+    align-items: center;
+    height: 100%;
+  }
+
+  .bar-fill {
+    width: 100%;
+    background: linear-gradient(180deg, var(--accent-1), var(--accent-2));
+    border-radius: 12px 12px 4px 4px;
+    position: relative;
+    box-shadow: 0 -10px 30px -10px var(--glow-1);
+    transition: height 1s var(--ease-out);
+  }
+
+  body.theme-premium .bar-fill {
+    background: linear-gradient(180deg, var(--accent-1), var(--accent-4));
+    box-shadow: 0 -8px 22px -10px var(--glow-1);
+  }
+
+  .bar-fill::after {
+    content: "";
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 60%;
+    background: linear-gradient(180deg, rgba(255,255,255,0.18), transparent);
+    border-radius: 12px 12px 0 0;
+  }
+
+  .bar-meta {
+    position: absolute;
+    bottom: calc(100% + 12px);
+    text-align: center;
+    width: 100%;
+  }
+
+  .bar-meta .bar-value {
+    font-family: var(--font-display);
+    font-size: 16px;
+    font-weight: 500;
+    color: var(--text);
+    line-height: 1.1;
+    letter-spacing: -0.01em;
+  }
+
+  .bar-label {
+    margin-top: 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    text-align: center;
+    font-weight: 500;
+  }
+
+  .ch4-quote {
+    text-align: center;
+    margin-top: 30px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+  }
+
+  .ch4-quote p {
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 300;
+    line-height: 1.5;
+    color: var(--text);
+    letter-spacing: -0.005em;
+  }
+
+  .ch4-quote em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-2);
+  }
+
+  /* ============================================
+     CHAPTER 5 — vision
+     ============================================ */
+  .ch5-grid {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 28px;
+    margin-top: 14px;
+    align-items: start;
+  }
+
+  .vision-main {
+    padding: 44px 44px;
+    background: var(--surface-strong);
+    border: 1px solid var(--border-strong);
+    border-radius: 24px;
+    backdrop-filter: blur(40px);
+    -webkit-backdrop-filter: blur(40px);
+    box-shadow: var(--shadow-card);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .vision-main::before {
+    content: "";
+    position: absolute; inset: 0;
+    background:
+      radial-gradient(ellipse at top right, var(--glow-1), transparent 50%),
+      radial-gradient(ellipse at bottom left, var(--glow-2), transparent 50%);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  .vision-main > * { position: relative; }
+
+  .vision-main p {
+    font-family: var(--font-display);
+    font-weight: 300;
+    font-size: 26px;
+    line-height: 1.45;
+    color: var(--text);
+    letter-spacing: -0.012em;
+    margin-bottom: 18px;
+  }
+
+  .vision-main p em {
+    font-family: var(--font-italic);
+    font-style: italic;
+    color: var(--accent-1);
+  }
+
+  .vision-main p:last-child { margin-bottom: 0; }
+
+  .vision-side {
+    display: flex; flex-direction: column; gap: 16px;
+  }
+
+  .vision-card {
+    padding: 24px 26px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    transition: all 0.3s var(--ease-out);
+  }
+
+  .vision-card:hover {
+    border-color: var(--border-strong);
+    transform: translateY(-2px);
+  }
+
+  .vision-card .v-num {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-3);
+    letter-spacing: 0.18em;
+    margin-bottom: 12px;
+    font-weight: 500;
+  }
+
+  .vision-card h4 {
+    font-family: var(--font-display);
+    font-size: 20px;
+    font-weight: 400;
+    margin-bottom: 8px;
+    line-height: 1.2;
+    letter-spacing: -0.015em;
+    color: var(--text);
+  }
+
+  .vision-card p {
+    font-size: 14px;
+    line-height: 1.65;
+    color: var(--text-mid);
+  }
+
+  /* ============================================
+     CONTROLS
+     ============================================ */
+  .controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 70px;
+    padding-top: 30px;
+    border-top: 1px solid var(--border);
+  }
+
+  .nav-btn {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 13px;
+    padding: 14px 24px;
+    border-radius: 999px;
+    cursor: pointer;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    display: flex; align-items: center; gap: 10px;
+    transition: all 0.3s var(--ease-out);
+    font-weight: 500;
+    letter-spacing: -0.005em;
+  }
+
+  .nav-btn:hover:not(:disabled) {
+    background: var(--surface-strong);
+    border-color: var(--border-strong);
+    transform: translateX(2px);
+  }
+
+  .nav-btn.prev:hover:not(:disabled) { transform: translateX(-2px); }
+
+  .nav-btn:disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+  }
+
+  .nav-btn.next {
+    background: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+    border-color: transparent;
+    color: #fff;
+    box-shadow: 0 10px 30px -10px var(--glow-1);
+  }
+
+  body.theme-premium .nav-btn.next {
+    background: var(--text);
+    color: var(--bg-base);
+  }
+
+  .page-indicator {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-dim);
+    letter-spacing: 0.12em;
+    font-weight: 500;
+  }
+
+  .page-indicator span { color: var(--text); }
+
+  /* ============================================
+     RESPONSIVE
+     ============================================ */
+  @media (max-width: 900px) {
+    .shell { padding: 24px 24px 80px; }
+    .ch1-grid, .ch3-grid, .ch5-grid { grid-template-columns: 1fr; }
+    .ch2-flow { grid-template-columns: 1fr; }
+    .income-bars { grid-template-columns: repeat(5, 1fr); height: 220px; gap: 8px; }
+    .roadmap-node { width: 44px; height: 44px; font-size: 10px; }
+    .roadmap-node::after { font-size: 9px; letter-spacing: 0.08em; }
+    .vision-main { padding: 28px 24px; }
+    .vision-main p { font-size: 20px; }
+    .ch-headline { font-size: clamp(34px, 9vw, 56px); }
+  }
+
+  @media (max-width: 600px) {
+    .topbar { flex-direction: column; gap: 16px; align-items: flex-start; }
+    .roadmap-node::after { display: none; }
+  }
+</style>
+</head>
+<body class="theme-cosmic" id="artifacts-component-root-html">
+
+  <!-- background atmosphere -->
+  <div class="bg-stage">
+    <div class="orb o1"></div>
+    <div class="orb o2"></div>
+    <div class="orb o3"></div>
+  </div>
+  <div class="grain"></div>
+
+  <div class="shell">
+
+    <!-- TOPBAR -->
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark"><span>R</span></div>
+        <div class="brand-text">
+          <span>The Roadmap</span>
+          <small>A story in five chapters</small>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <div class="edit-hint" id="save-status"><span class="pulse"></span><span id="save-text">Edits auto-save</span></div>
+        <button class="save-btn" id="download-btn" title="Download a fresh HTML file with all your edits saved inside it">↓ Download saved</button>
+        <div class="theme-toggle">
+          <button class="active" data-theme="cosmic">Cosmic</button>
+          <button data-theme="premium" class="">Premium</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- ROADMAP -->
+    <nav class="roadmap" aria-label="Chapter roadmap">
+      <div class="roadmap-track">
+        <div class="roadmap-line"></div>
+        <div class="roadmap-progress" style="width: 0%;"></div>
+        <button class="roadmap-node active" data-go="1" data-label="Origin"><span class="num">01</span></button>
+        <button class="roadmap-node" data-go="2" data-label="The search"><span class="num">02</span></button>
+        <button class="roadmap-node" data-go="3" data-label="The build"><span class="num">03</span></button>
+        <button class="roadmap-node" data-go="4" data-label="Growth"><span class="num">04</span></button>
+        <button class="roadmap-node" data-go="5" data-label="Vision"><span class="num">05</span></button>
+      </div>
+    </nav>
+
+    <!-- STAGE -->
+    <main class="stage">
+
+      <!-- ============== CHAPTER 1 ============== -->
+      <section class="chapter active" data-chapter="1">
+        <div class="ch-meta"><span class="dot"></span><span>Chapter 01 · Origin</span></div>
+        <h1 class="ch-headline" contenteditable="true" data-edit-id="e0">How it, <em>all started</em>.</h1>
+        <p class="ch-sub" contenteditable="true" data-edit-id="e1">The Agenda and story to play in their mind........</p>
+
+        <div class="ch1-grid">
+          <div class="ch1-quote">
+            <p contenteditable="true" data-edit-id="e2">Muskan&nbsp; met <em>Muskai</em> on Xyra. We talked. We connected. She also wanted to do something online — and so did I. We had time, but we dont know what to do then we decided to work together and find something we can work we found about dropshipping project management....But did not got the clear path ... then we started researching more and found a model where we can sell the skills as a freelancer and make money......Then we both locked in and after so much time we made it succeed......</p>
+          </div>
+          <div class="ch1-side">
+            <div class="stat-card">
+              <div class="stat-label" contenteditable="true" data-edit-id="e3">Where it began</div>
+              <div class="stat-value" contenteditable="true" data-edit-id="e4">A chat on <em>Xyra</em></div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label" contenteditable="true" data-edit-id="e5">What we shared</div>
+              <div class="stat-value" contenteditable="true" data-edit-id="e6">The same <em>quiet hunger</em></div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-label" contenteditable="true" data-edit-id="e7">What we had</div>
+              <div class="stat-value" contenteditable="true" data-edit-id="e8">Time. And <em>vision to feed</em>.</div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============== CHAPTER 2 ============== -->
+      <section class="chapter" data-chapter="2">
+        <div class="ch-meta"><span class="dot"></span><span>Chapter 02 · The search</span></div>
+        <h1 class="ch-headline" contenteditable="true" data-edit-id="e9">Looking for <em>a way and Intro of Muskan</em></h1>
+        <p class="ch-sub" contenteditable="true" data-edit-id="e10"><br></p>
+
+        <div class="ch2-flow">
+          <div class="flow-step">
+            <div class="step-num" contenteditable="true" data-edit-id="e11">STEP 01</div>
+            <h4 contenteditable="true" data-edit-id="e12">We started looking out</h4>
+            <p contenteditable="true" data-edit-id="e13">What jobs, what organizations could let us earn remotely — and let us actually make it work.</p>
+          </div>
+          <div class="flow-step">
+            <div class="step-num" contenteditable="true" data-edit-id="e14">STEP 02</div>
+            <h4 contenteditable="true" data-edit-id="e15">We found a way</h4>
+            <p contenteditable="true" data-edit-id="e16">A model. Freelancing. Selling services. Real money for real work.</p>
+          </div>
+          <div class="flow-step">
+            <div class="step-num" contenteditable="true" data-edit-id="e17">STEP 03</div>
+            <h4 contenteditable="true" data-edit-id="e18">We chose long-term</h4>
+            <p contenteditable="true" data-edit-id="e19">To get paid more, we knew we had to stop chasing quick wins. We had to build it slowly, the right way.</p>
+          </div>
+        </div>
+
+        <div class="ch2-callout">
+          <p contenteditable="true" data-edit-id="e20">We were working really hard but we didn't tell you, because we weren't making any money yet. We were just planning. <em>Now we are locked in</em> — and we can make it work. thats why we told you lie that she is my friend.. but she was my work Partner we are working together to make money and get success.....So we started working together planning failing working and now its all started and we wanna scale....</p>
+        </div>
+      </section>
+
+      <!-- ============== CHAPTER 3 ============== -->
+      <section class="chapter" data-chapter="3">
+        <div class="ch-meta"><span class="dot"></span><span>Chapter 03 · The build</span></div>
+        <h1 class="ch-headline" contenteditable="true" data-edit-id="e21">Two roles, <em>one mission</em>.</h1>
+        <p class="ch-sub" contenteditable="true" data-edit-id="e22">A year in. Two parts of the same machine, running together to make it work and make money.... ( What they will know in clarity what you do...</p>
+
+        <div class="ch3-grid">
+          <div class="role-card role-her">
+            <span class="role-tag" contenteditable="true" data-edit-id="e23">Muskan side · client + ads</span>
+            <h3 contenteditable="true" data-edit-id="e24">Marketing <em>operations</em></h3>
+            <p class="role-title" contenteditable="true" data-edit-id="e25">Marketing Operations Specialist · Freelance, remote.</p>
+            <p class="role-body" contenteditable="true" data-edit-id="e26">Muskan helps businesses run Campaigns, manage systems, and improve their online sales and run awareness campaign to work as a senior operation expert . I work remotely and building skills and trying to network from the big people...Things Im learning is listed Below</p>
+            <div class="role-services">
+              <span class="chip" contenteditable="true" data-edit-id="e27">Meta &amp; Google ads</span>
+              <span class="chip" contenteditable="true" data-edit-id="e28">Lead generation</span>
+              <span class="chip" contenteditable="true" data-edit-id="e29">Automation tools</span>
+              <span class="chip" contenteditable="true" data-edit-id="e30">Client coordination</span>
+              <span class="chip" contenteditable="true" data-edit-id="e31">Daily learning</span>
+            </div>
+          </div>
+          <div class="role-card role-him">
+            <span class="role-tag" contenteditable="true" data-edit-id="e32">Muskaie side · build + delivery</span>
+            <h3 contenteditable="true" data-edit-id="e33">The <em>front end</em>, the systems</h3>
+            <p class="role-title" contenteditable="true" data-edit-id="e34">Infrastructure · websites · client conversations.</p>
+            <p class="role-body" contenteditable="true" data-edit-id="e35">Muskai handles the front end — managing infrastructure, websites, conversations, and everything that holds the operation together she focus on getting the project and post delivery of the work which includes number management and talk to them so we can work long term. We both handle different parts and run it together....</p>
+            <div class="role-services">
+              <span class="chip" contenteditable="true" data-edit-id="e36">Infrastructure</span>
+              <span class="chip" contenteditable="true" data-edit-id="e37">Website builds</span>
+              <span class="chip" contenteditable="true" data-edit-id="e38">Client conversations</span>
+              <span class="chip" contenteditable="true" data-edit-id="e39">Delivery</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="ch3-coda">
+          <p contenteditable="true" data-edit-id="e40">She talks to MNCs and companies all over the world. I learned Operation&nbsp; advertising, and I deliver the work. <em>That's how it runs.</em></p>
+        </div>
+      </section>
+
+      <!-- ============== CHAPTER 4 ============== -->
+      <section class="chapter" data-chapter="4">
+        <div class="ch-meta"><span class="dot"></span><span>Chapter 04 · Growth</span></div>
+        <h1 class="ch-headline" contenteditable="true" data-edit-id="e41">Month by <em>month</em>.</h1>
+        <p class="ch-sub" contenteditable="true" data-edit-id="e42">The Money Agenda.....to start and become independent</p>
+
+        <div class="ch4-timeline">
+          <div class="income-bars">
+            <div class="income-bar">
+              <div class="bar-fill" style="height: 28%;">
+                <div class="bar-meta"><div class="bar-value" contenteditable="true" data-edit-id="e43">₹30–40k</div></div>
+              </div>
+              <div class="bar-label" contenteditable="true" data-edit-id="e44">May</div>
+            </div>
+            <div class="income-bar">
+              <div class="bar-fill" style="height: 42%;">
+                <div class="bar-meta"><div class="bar-value" contenteditable="true" data-edit-id="e45">₹50–60k</div></div>
+              </div>
+              <div class="bar-label" contenteditable="true" data-edit-id="e46">June</div>
+            </div>
+            <div class="income-bar">
+              <div class="bar-fill" style="height: 56%;">
+                <div class="bar-meta"><div class="bar-value" contenteditable="true" data-edit-id="e47">₹60–80k</div></div>
+              </div>
+              <div class="bar-label" contenteditable="true" data-edit-id="e48">Jul – Aug</div>
+            </div>
+            <div class="income-bar">
+              <div class="bar-fill" style="height: 78%;">
+                <div class="bar-meta"><div class="bar-value" contenteditable="true" data-edit-id="e49">₹80k – 1L</div></div>
+              </div>
+              <div class="bar-label" contenteditable="true" data-edit-id="e50">Sep to Nov</div>
+            </div>
+            <div class="income-bar">
+              <div class="bar-fill" style="height: 100%;">
+                <div class="bar-meta"><div class="bar-value" contenteditable="true" data-edit-id="e51">₹1.2L+</div></div>
+              </div>
+              <div class="bar-label" contenteditable="true" data-edit-id="e52">December</div>
+            </div>
+          </div>
+          <div class="ch4-quote">
+            <p contenteditable="true" data-edit-id="e53">We gonna make sure we are not blindly raising the expectation so we can work smoothly for upcoming future this year is to get safe place in their mind and they can have the idea her Girl is independent&nbsp; and doing some serious stuff and it's very important we can show them the potential so you can become superior and be like you are thje real entrepreneur..they will get mad for sure...</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============== CHAPTER 5 ============== -->
+      <section class="chapter" data-chapter="5">
+        <div class="ch-meta"><span class="dot"></span><span>Chapter 05 · The vision</span></div>
+        <h1 class="ch-headline" contenteditable="true" data-edit-id="e54">The <em>independent</em> life&nbsp;</h1>
+        <p class="ch-sub" contenteditable="true" data-edit-id="e55">This is the main important goal is where we gonna build a Psychi around muskan so we can get our outcomes as a result of this conditioning.....show them evidence that will change their mind and everything around us so we can get more done in less time..........We gonna handle their Objection and show them the Path of what we want....</p>
+
+        <div class="ch5-grid">
+          <div class="vision-main">
+            <p contenteditable="true" data-edit-id="e56">The Story to show <br><br>Now I want to be <em>independent</em>. I want to be on my own. Buy my own house. Buy my own car. get myself so big that I dont rely on it I will not let anyone come between my dreams and anything.</p>
+            <p contenteditable="true" data-edit-id="e57">I want my career to be big. I saw the dreams — and <em>I will work for this day and night</em>.</p>
+            <p contenteditable="true" data-edit-id="e58">I will become the independent lady.<div><br></div><div>Now this is we gonna preach okay?</div></p>
+          </div>
+          <div class="vision-side">
+            <div class="vision-card">
+              <div class="v-num" contenteditable="true" data-edit-id="e59">NEXT · 01</div>
+              <h4 contenteditable="true" data-edit-id="e60">OBJECTION HANDLE</h4>
+              <p contenteditable="true" data-edit-id="e61">They gonna ask what how when....We should be proof of proof of everything that we can run on...<br><br>They can ask...<div>Where you learned....Tell them YT workshops Books ETC<br>Proof?-- 7 Yt channels&nbsp;<br>What you do how you do.... show them Ai how you use some software some documents how you work slack and everything building website etc etc...&nbsp; Clients call.. Managing calls... Interview etc...<br>How you getting money....Getting retainer for Management the more the high end work the more is the Pay.....USD $&nbsp;<br><br>This alone will make us win..<br></div></p>
+            </div>
+            <div class="vision-card">
+              <div class="v-num" contenteditable="true" data-edit-id="e62">NEXT · 02</div>
+              <h4 contenteditable="true" data-edit-id="e63">PSYCHI CHANGER</h4>
+              <p contenteditable="true" data-edit-id="e64">Now we gonna do things to make it in our Behavior in early start so they can't even doubt Subconsciously..<br><br>After making money for May.....Start asking for little help so they think she is doing with their understanding.. try to make it look smoother for example Getting room locked because of important call, telling them to buy something so you can use in the work asking for it that should I choose this or that....Gonna go out for Events to scale the Business..<br><br>Then.....<br>Letter thing...Write your goals and leave them in a way that they can read they will think it is an accident but its not,,,Try to touch core point.. that you wanna help dad with loan wanna be independent etc etc we will figure it out...<br><br>That's the whole story we need nothing else..</p>
+            </div>
+            <div class="vision-card">
+              <div class="v-num" contenteditable="true" data-edit-id="e65">NEXT · 03</div>
+              <h4 contenteditable="true" data-edit-id="e66">That's all we need</h4>
+              <p contenteditable="true" data-edit-id="e67">This whole model is enough to get a real business and you can work without any problem and just enjoy life together.....</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+    </main>
+
+    <!-- CONTROLS -->
+    <footer class="controls">
+      <button class="nav-btn prev" disabled="">← Previous chapter</button>
+      <div class="page-indicator"><span id="cur">01</span> / 05</div>
+      <button class="nav-btn next">Next chapter →</button>
+    </footer>
+
+  </div>
+
+<script>
+  (function() {
+    const total = 5;
+    let current = 1;
+
+    const chapters = document.querySelectorAll('.chapter');
+    const nodes = document.querySelectorAll('.roadmap-node');
+    const progress = document.querySelector('.roadmap-progress');
+    const prevBtn = document.querySelector('.nav-btn.prev');
+    const nextBtn = document.querySelector('.nav-btn.next');
+    const indicator = document.getElementById('cur');
+    const themeButtons = document.querySelectorAll('.theme-toggle button');
+
+    function go(n) {
+      n = Math.max(1, Math.min(total, n));
+      current = n;
+
+      chapters.forEach(c => c.classList.toggle('active', +c.dataset.chapter === n));
+      nodes.forEach(node => {
+        const idx = +node.dataset.go;
+        node.classList.toggle('active', idx === n);
+        node.classList.toggle('done', idx < n);
+      });
+
+      const pct = ((n - 1) / (total - 1)) * 100;
+      progress.style.width = pct + '%';
+
+      indicator.textContent = String(n).padStart(2, '0');
+      prevBtn.disabled = n === 1;
+      nextBtn.disabled = n === total;
+      nextBtn.textContent = n === total ? 'You are at the end' : 'Next chapter →';
+
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+
+    nodes.forEach(node => {
+      node.addEventListener('click', () => go(+node.dataset.go));
+    });
+
+    prevBtn.addEventListener('click', () => go(current - 1));
+    nextBtn.addEventListener('click', () => { if (current < total) go(current + 1); });
+
+    document.addEventListener('keydown', (e) => {
+      if (document.activeElement && document.activeElement.isContentEditable) return;
+      if (e.key === 'ArrowRight') go(current + 1);
+      if (e.key === 'ArrowLeft') go(current - 1);
+    });
+
+    themeButtons.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const theme = btn.dataset.theme;
+        document.body.classList.remove('theme-cosmic', 'theme-premium');
+        document.body.classList.add('theme-' + theme);
+        themeButtons.forEach(b => b.classList.toggle('active', b === btn));
+      });
+    });
+
+    // ============================================
+    // AUTO-SAVE — every edit saves to browser memory
+    // Survives refreshes. Restores on next visit.
+    // ============================================
+    const STORAGE_KEY = 'roadmap-edits-v1';
+    const editables = document.querySelectorAll('[contenteditable="true"]');
+    const saveStatus = document.getElementById('save-status');
+    const saveText = document.getElementById('save-text');
+
+    // give each editable a stable id based on position
+    editables.forEach((el, i) => { el.dataset.editId = 'e' + i; });
+
+    function loadEdits() {
+      try {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (!saved) return;
+        const data = JSON.parse(saved);
+        editables.forEach(el => {
+          const id = el.dataset.editId;
+          if (data[id] !== undefined) el.innerHTML = data[id];
+        });
+        flashSaved('Restored your edits');
+      } catch (err) { console.warn('Could not restore edits:', err); }
+    }
+
+    let saveTimer;
+    function saveEdits() {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => {
+        const data = {};
+        editables.forEach(el => { data[el.dataset.editId] = el.innerHTML; });
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+          flashSaved('Saved');
+        } catch (err) {
+          saveText.textContent = 'Save failed';
+        }
+      }, 400);
+    }
+
+    function flashSaved(msg) {
+      saveStatus.classList.add('saved');
+      saveText.textContent = msg;
+      clearTimeout(flashSaved._t);
+      flashSaved._t = setTimeout(() => {
+        saveStatus.classList.remove('saved');
+        saveText.textContent = 'Edits auto-save';
+      }, 1800);
+    }
+
+    editables.forEach(el => {
+      el.addEventListener('input', saveEdits);
+      el.addEventListener('blur', saveEdits);
+    });
+
+    // ============================================
+    // DOWNLOAD — bake current edits into a fresh HTML
+    // file. Upload that to GitHub to make changes live.
+    // ============================================
+    const downloadBtn = document.getElementById('download-btn');
+    downloadBtn.addEventListener('click', () => {
+      // clone the document, strip browser-only state
+      const clone = document.documentElement.cloneNode(true);
+
+      // ensure cloned editables have current content
+      const cloneEditables = clone.querySelectorAll('[contenteditable="true"]');
+      editables.forEach((el, i) => {
+        if (cloneEditables[i]) cloneEditables[i].innerHTML = el.innerHTML;
+      });
+
+      // set the active chapter back to 1 in the saved file
+      // so visitors always start at the beginning
+      clone.querySelectorAll('.chapter').forEach((c, i) => {
+        c.classList.toggle('active', i === 0);
+      });
+      clone.querySelectorAll('.roadmap-node').forEach((n, i) => {
+        n.classList.remove('done');
+        n.classList.toggle('active', i === 0);
+      });
+      const cloneProgress = clone.querySelector('.roadmap-progress');
+      if (cloneProgress) cloneProgress.style.width = '0%';
+
+      const html = '<!DOCTYPE html>\n' + clone.outerHTML;
+      const blob = new Blob([html], { type: 'text/html' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'index.html';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      flashSaved('Downloaded — upload to GitHub');
+    });
+
+    // restore any edits from a previous session
+    loadEdits();
+
+    // initial progress sync
+    progress.style.width = '0%';
+  })();
+</script>
+
+
+</body></html>
